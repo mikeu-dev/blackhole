@@ -7,214 +7,174 @@ void main() {
 `;
 
 export const fragmentShader = `
+precision highp float;
+
 uniform float uTime;
 uniform vec2 uResolution;
 uniform vec3 uCameraPos;
 uniform vec3 uCameraDir;
 uniform vec3 uCameraUp;
-uniform sampler2D uDiskTexture;
-uniform float uSpin; // 0.0 to 1.0 (approx)
+uniform float uSpin; 
 
 varying vec2 vUv;
 
 // --- CONSTANTS ---
 const float PI = 3.14159265359;
-const float PI2 = 6.28318530718;
+const int MAX_STEPS = 65; // Optimized for laptop (prev 100)
+const float MAX_DIST = 40.0;
+const float STEP_SIZE = 0.08; // Larger steps (prev 0.05)
 
-// Simulation Units
-// Mass M = 1.0. 
-// Kerr Horizon Rh = M + sqrt(M^2 - a^2).
-// For a=0.9, Rh ~ 1.45.
-// ISCO Prograde ~ 2.32 M
-// ISCO Retrograde ~ 8.7 M
-// We visualize a disk from ~2.6 to 19.0 for aesthetics.
-
-const float DISC_INNER = 2.6;
-const float DISC_OUTER = 19.0;
-const int MAX_STEPS = 140; 
-const float MAX_DIST = 60.0;
-
-// High-Contrast Starfield
-float hash(vec2 p) {
-    p = fract(p * vec2(123.34, 456.21));
-    p += dot(p, p + 45.32);
-    return fract(p.x * p.y);
-}
-vec3 getStarfield(vec3 dir) {
-    float n = hash(dir.xy * 800.0 + dir.z * 300.0);
-    float stars = step(0.999, n) * (n - 0.999) * 2000.0; // Sparse but bright
-    return vec3(stars);
+// --- NOISE ---
+// Generates a starfield and subtle nebula
+float hash(vec3 p) {
+    p = fract(p * 0.3183099 + .1);
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
 }
 
-// --- PHYSICS ---
-
-// Approximated "Frame Dragging" Geodesic Acceleration
-// We simulate the effect of spin by adding a "twisting" force
-// and modifying the effective radial pull based on angular momentum alignment.
-vec3 getKerrAccel(vec3 p, vec3 v, float h2) {
-    float r2 = dot(p, p);
-    float r = sqrt(r2);
-    
-    // Schwarzschild Base Term
-    vec3 accel = -1.5 * 2.0 * h2 * p / (r2 * r2 * r);
-    
-    // Frame Dragging (Lense-Thirring effect approx)
-    // Drag velocity ~ 1/r^3 in phi direction
-    // We add a tangential acceleration
-    vec3 spinAxis = vec3(0.0, 1.0, 0.0);
-    vec3 dragDir = cross(spinAxis, p); // Tangential
-    // Strength proportional to spin * 1/r^4 ?
-    float dragStrength = uSpin * 2.0 / (r2 * r2);
-    accel += dragDir * dragStrength;
-
-    return accel;
+float noise(vec3 x) {
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+                   mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                   mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
 }
 
-// --- DISK SAMPLING ---
-vec4 sampleDiskTexture(vec3 p, float r) {
-    if (r < DISC_INNER || r > DISC_OUTER) return vec4(0.0);
+float fbm(vec3 p) {
+    float v = 0.0;
+    float a = 0.5;
+    // Reduced to 2 octaves for inner loop performance
+    for (int i = 0; i < 2; i++) {
+        v += a * noise(p);
+        p *= 2.0;
+        a *= 0.5;
+    }
+    return v;
+}
+
+vec3 getBackground(vec3 dir) {
+    float n = hash(dir * 200.0);
+    // Cheap starfield
+    float stars = step(0.998, n) * (n-0.998) * 500.0;
     
-    // Texture Mapping
-    // U = Angle / 2PI
-    // V = (r - Inner) / (Outer - Inner)
+    // Nebula (keep it simple outside loop)
+    float neb = noise(dir * 2.0); 
+    vec3 nebCol = vec3(0.02, 0.03, 0.06) * neb * 0.5;
     
-    float angle = atan(p.z, p.x); // -PI to PI
-    float u = angle / PI2 + 0.5 + uTime * 0.05 * (10.0/r); // Rotate based on radius
-    float v = (r - DISC_INNER) / (DISC_OUTER - DISC_INNER);
+    return vec3(stars) + nebCol;
+}
+
+// --- PHYSICS & DISK ---
+
+// Color Mapping (Blackbody-ish)
+vec3 getDiskColor(float t) {
+    // Optimized gradient: Orange -> White
+    return mix(vec3(1.0, 0.1, 0.0), vec3(1.0, 1.0, 0.8), t);
+}
+
+// Disk Sampling
+vec4 sampleDisk(vec3 p, float r) {
+    // Quick Bounding Box Check
+    if (abs(p.y) > 0.8) return vec4(0.0); // Tighter height check
     
-    // Sample texture
-    vec3 texCol = texture2D(uDiskTexture, vec2(u, v)).rgb;
+    // Disk Geometry
+    float inner = 2.6;
+    float outer = 14.0;
     
-    // Enhance HDR
-    texCol = pow(texCol, vec3(2.2)); // Gamma correction / Contrast
-    texCol *= 4.0; // Boost brightness
+    if (r < inner || r > outer) return vec4(0.0);
     
-    // Alpha/Density derived from brightness
-    float brightness = dot(texCol, vec3(0.33));
-    float alpha = smoothstep(0.1, 0.8, brightness);
+    // Density falloff
+    float density = 1.0 - smoothstep(0.0, 0.8, abs(p.y)); // Simplified height
+    density *= smoothstep(inner, inner+1.0, r);
+    density *= 1.0 - smoothstep(outer-2.0, outer, r);
     
-    // Soft edges
-    float thickness = 0.05 * (1.0 + r/10.0);
-    alpha *= (1.0 - smoothstep(0.0, thickness, abs(p.y)));
+    if (density < 0.01) return vec4(0.0);
     
-    return vec4(texCol, alpha);
+    // Vortex Pattern
+    // Use lower quality noise for performance
+    float ang = atan(p.z, p.x);
+    float swirl = 8.0 / max(r, 0.1);
+    float u = ang + swirl + uTime * (2.0 / max(r, 1.0));
+    
+    // Single noise sample instead of FBM for inner loop
+    float n = noise(vec3(r * 1.5, u * 1.5, p.y * 4.0));
+    n = smoothstep(0.3, 0.7, n);
+    
+    // Color
+    float temp = 1.0 - smoothstep(inner, outer, r);
+    temp += n * 0.3;
+    vec3 col = getDiskColor(clamp(temp * 1.2, 0.0, 1.0)); // Boost brightness slightly
+    
+    float alpha = density * n * 0.6;
+    return vec4(col * 2.5, alpha);
 }
 
 void main() {
-    // 1. Setup
+    // Normalize coordinates
     vec2 uv = vUv * 2.0 - 1.0;
     uv.x *= uResolution.x / uResolution.y;
     
+    // Dynamic Resolution Scaling (Optional: manually downscale ray count logic if we could)
+    // For now we rely on larger steps.
+    
     vec3 ro = uCameraPos;
     vec3 camFwd = normalize(uCameraDir);
-    vec3 camUpVec = normalize(uCameraUp);
-    vec3 camRight = cross(camFwd, camUpVec);
-    vec3 rd = normalize(camFwd + uv.x * camRight + uv.y * camUpVec);
-
+    vec3 camUp = normalize(uCameraUp);
+    vec3 camRight = cross(camFwd, camUp);
+    vec3 rd = normalize(camFwd + uv.x * camRight + uv.y * camUp);
+    
     vec3 p = ro;
     vec3 v = rd;
     
-    vec3 hVec = cross(p, v);
-    float h2 = dot(hVec, hVec);
-    
-    // Check initial spin alignment for Shadow D-shape heuristic
-    // If ray is on left (moving with spin), it can get closer.
-    // spin is Y axis.
-    // Ray impact parameter on X axis determines side.
-    // Simplified: Shadow is offset.
-    
     vec3 col = vec3(0.0);
     vec3 transmittance = vec3(1.0);
-    float bloom = 0.0;
-    float dt = 0.5;
     
-    // Horizon Radius approx for a=0.95
-    float rh = 1.35; 
-    
-    // 2. Integration
+    // Ray Marching
     for(int i=0; i<MAX_STEPS; i++) {
-        float r2 = dot(p, p);
+        float r2 = dot(p,p);
         float r = sqrt(r2);
         
-        // --- Horizon Check (D-Shape Heuristic) ---
-        // Effective capture radius depends on impact parameter.
-        // For equatorial ray:
-        // b_critical (prograde) ~ 2 M (normalized)
-        // b_critical (retrograde) ~ 7 M
-        // We simulate this by warping the 'r' check or the limit.
-        // Or simply: visual event horizon is defined by the Photon Capture region.
-        // We let the ray fall in.
-        if (r < rh) {
-            break; // Absorbed
-        }
-        
-        if (r > MAX_DIST) {
-            col += transmittance * getStarfield(v);
+        // Event Horizon
+        if (r < 2.0) {
+            col += vec3(0.0); 
+            transmittance = vec3(0.0);
             break;
         }
         
-        // Bloom
-        float dRing = abs(r - 2.8); // Photon sphere approx
-        bloom += 0.05 / (dRing * dRing + 0.1); 
-
-        // Step
-        dt = max(0.02, r * 0.05);
-        if(abs(p.y) < 0.5 && r < DISC_OUTER + 1.0) dt = min(dt, 0.05);
+        if (r > MAX_DIST) {
+            col += transmittance * getBackground(v);
+            break;
+        }
         
-        // RK4 Integration with Kerr Accel
-        vec3 k1v = getKerrAccel(p, v, h2);
-        vec3 p2 = p + v * dt * 0.5;
-        vec3 v2 = v + k1v * dt * 0.5;
+        // Gravity (Newtonian approx)
+        float rSafe = max(r, 0.5); // Increase safety margin
+        vec3 acc = -1.5 * p / (rSafe * rSafe * rSafe); 
         
-        vec3 k2v = getKerrAccel(p2, v2, h2);
-        vec3 p3 = p + v2 * dt * 0.5;
-        vec3 v3 = v + k2v * dt * 0.5;
+        // Adaptive Step
+        float dt = max(STEP_SIZE, r * 0.08); // More aggressive stepping at distance
+        if (abs(p.y) < 1.0 && r < 15.0) dt = 0.06; // Slower near disk
         
-        vec3 k3v = getKerrAccel(p3, v3, h2);
-        vec3 p4 = p + v3 * dt;
-        vec3 v4 = v + k3v * dt;
-        
-        vec3 k4v = getKerrAccel(p4, v4, h2);
-        
-        p += (v + 2.0*v2 + 2.0*v3 + v4) * (dt / 6.0);
-        v += (k1v + 2.0*k2v + 2.0*k3v + k4v) * (dt / 6.0);
+        v += acc * dt;
         v = normalize(v);
+        p += v * dt;
         
-        // --- Texture Sampling ---
-        float mr = length(p);
-        if(mr < DISC_OUTER && mr > DISC_INNER && abs(p.y) < 0.1) {
-             vec4 data = sampleDiskTexture(p, mr);
-             if(data.a > 0.01) {
-                 // Relativistic Beaming
-                 vec3 tanVec = normalize(cross(vec3(0,1,0), p));
-                 float alignment = dot(tanVec, v); 
-                 
-                 // Smooth Doppler
-                 float beaming = pow(1.0 - alignment * 0.7, 4.0); // Extreme Beaming
-                 
-                 // Redshift Tint (Smooth)
-                 vec3 blue = vec3(0.9, 0.95, 1.0);
-                 vec3 red = vec3(1.0, 0.4, 0.1);
-                 float shift = 0.5 - 0.5 * alignment;
-                 vec3 tint = mix(red, blue, shift);
-                 
-                 vec3 emission = data.rgb * beaming * tint * 2.5;
-                 
-                 float stepDens = data.a * dt * 5.0;
-                 col += transmittance * emission * stepDens;
+        // Disk Accumulation
+        if (abs(p.y) < 0.8 && r < 14.0 && r > 2.5) {
+             vec4 samp = sampleDisk(p, r);
+             if (samp.a > 0.01) {
+                 float stepDens = samp.a * dt;
+                 col += transmittance * samp.rgb * stepDens;
                  transmittance *= (1.0 - stepDens);
-                 
-                 if(transmittance.x < 0.01) break;
+                 if (transmittance.x < 0.05) break; // Early exit earlier
              }
         }
     }
     
-    // Bloom Composite
-    col += vec3(0.8, 0.6, 0.3) * bloom * 0.002;
-    
-    // Tone Mapping
-    col = col / (col + vec3(1.0)); // Reinhard simple for stability
-    col = pow(col, vec3(1.0/2.2)); // Gamma
+    // Tone Mapping (Reinhard)
+    col = col / (col + vec3(1.0));
+    col = pow(col, vec3(1.0/2.2));
     
     gl_FragColor = vec4(col, 1.0);
 }
