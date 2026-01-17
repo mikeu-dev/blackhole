@@ -1,2 +1,13 @@
-<h1>Welcome to SvelteKit</h1>
-<p>Visit <a href="https://svelte.dev/docs/kit">svelte.dev/docs/kit</a> to read the documentation</p>
+<script>
+	import { Canvas } from '@threlte/core';
+	import BlackholeScene from '$lib/components/BlackholeScene.svelte';
+	import { T } from '@threlte/core';
+</script>
+
+<div class="h-screen w-full overflow-hidden bg-black">
+	<Canvas>
+		<T.PerspectiveCamera makeDefault position={[0, 0, 5]} fov={75}></T.PerspectiveCamera>
+
+		<BlackholeScene />
+	</Canvas>
+</div>
